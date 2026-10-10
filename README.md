@@ -16,6 +16,48 @@ pip install -e .
 
 Read through the [imitation learning setup documentation](https://maniskill.readthedocs.io/en/latest/user_guide/learning_from_demos/setup.html) which details everything you need to know regarding running imitation learning baselines in ManiSkill. It includes details on how to download demonstration datasets, preprocess them, evaluate policies fairly for comparison, as well as suggestions to improve performance and avoid bugs.
 
+## Collecting Nori demonstrations for ACT
+
+Run from this directory in a graphical session after installing the dependencies with
+`pip install -e .`. The Nori task is registered by the collector. Its `state`
+observations include cube and goal positions, and its recorded actions use
+`pd_joint_delta_pos`, the mode supported by ACT's state dataset loader.
+
+```bash
+python collect_nori_demos.py --num-successes 20
+```
+
+Drag the **left gripper TCP** gizmo and the end effector follows as you move it.
+Press `g` to toggle the gripper, `n` to recenter the gizmo, `c` to finish an attempt,
+`r` to discard it and retry the same seed, `b` to discard it and load a new cube/goal
+layout, or `q` to quit. Center the cube between
+the fingers with the fingers clear of the table; after pressing `g`, hold the gizmo
+still for 28 control steps (1.4 simulated seconds) before lifting. Only episodes
+successful at their last step are saved. The collector writes
+`demos/Nori-Pick-Place-v1/teleop/trajectory.h5` and the matching `.json`.
+Use `--trajectory-name` for another run; an existing dataset is never overwritten.
+The tool uses SAPIEN IK and joint-space steps, without collision-aware path
+planning. Make short moves around the table and inspect the robot's motion.
+
+The ACT-specific `nori/nori_act.urdf` fixes Nori's uncommanded wheels,
+lift, and right arm. The agent disables internal robot collisions and uses
+one gripper mimic mechanism; its delta arm controller holds the last target
+when given zero arm action. The collector checks for unstable arm positions.
+Both collection and ACT evaluation use this same robot setup. Once you have
+successful episodes, start state-based training with:
+
+```bash
+python train.py --env-id Nori-Pick-Place-v1 \
+  --demo-path demos/Nori-Pick-Place-v1/teleop/trajectory.h5 \
+  --control-mode pd_joint_delta_pos --sim-backend physx_cpu \
+  --num-demos 20 --batch-size 16 --max-episode-steps 500 \
+  --num-eval-envs 1 --total-iters 30000 --no-capture-video
+```
+
+Choose `--batch-size` below the total number of recorded action steps. ACT's
+training process imports the Nori task, and checks the control mode in the
+trajectory metadata.
+
 ## Training
 
 We provide scripts to train ACT on demonstrations.

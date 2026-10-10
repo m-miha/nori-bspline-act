@@ -3,3 +3,4 @@ wandb/
 nori_description/
 __pycache__/
 *.pyc
+demos/

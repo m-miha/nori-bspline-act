@@ -7,9 +7,18 @@ from mani_skill.sensors.camera import CameraConfig
 @register_agent()
 class NoriLeftArmAgent(BaseAgent):
     uid = "nori_a3"
-    urdf_path = str("nori/nori.urdf")
+    urdf_path = str("nori/nori_act.urdf")
+    urdf_config = dict(
+        _materials=dict(
+            gripper=dict(static_friction=2.0, dynamic_friction=2.0, restitution=0.0)
+        ),
+        link=dict(
+            left_gripper_link=dict(material="gripper", patch_radius=0.1, min_patch_radius=0.1),
+            left_gripper_idler_link=dict(material="gripper", patch_radius=0.1, min_patch_radius=0.1),
+        ),
+    )
     fix_root_link = True
-    #disable_self_collisions = True
+    disable_self_collisions = True
 
 
     arm_stiffness = 1e3
@@ -55,11 +64,12 @@ class NoriLeftArmAgent(BaseAgent):
             damping=self.arm_damping,
             force_limit=self.arm_force_limit,
             use_delta=True,
+            use_target=True,
         )
         gripper_pd_joint_pos = PDJointPosMimicControllerConfig(
             self.gripper_joint_names,
-            lower=-0.01,  # a trick to have force when the object is thin
-            upper=0.04,
+            lower=0.0,
+            upper=0.8,
             stiffness=self.gripper_stiffness,
             damping=self.gripper_damping,
             force_limit=self.gripper_force_limit,
@@ -89,8 +99,8 @@ class NoriLeftArmAgent(BaseAgent):
             CameraConfig(
                 uid="front_camera_mount_frame",
                 pose=sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]),
-                width=128,
-                height=128,
+                width=720,
+                height=720,
                 fov=np.pi / 2,
                 near=0.01,
                 far=100,

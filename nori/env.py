@@ -13,15 +13,21 @@ from mani_skill.utils.building.ground import build_ground
 
 import torch
 
-@register_env("Nori-Pick-Place-v1", max_episode_steps=500)
+@register_env("Nori-Pick-Place-v1", max_episode_steps=1000)
 class NoriPickPlaceEnv(BaseEnv):
 
     SUPPORTED_ROBOTS = ["nori_a3"]
     goal_radius = 0.06
     cube_half_size = 0.02
+    placement_height_tolerance = 0.01
     floor_z = 0
     x = -.5
     agent: NoriLeftArmAgent
+    # TCP above the table, pointing +X with the open jaws level along Y.
+    robot_start_qpos = np.array(
+        [-1.20465, -1.47397, 0.81563, 0.90344, 0.91489, -0.53418, -0.30929, 0.8, -0.8],
+        dtype=np.float32,
+    )
 
     def __init__(self, *args, robot_uids="nori_a3", **kwargs):
         # robot_uids="fetch" is possible, or even multi-robot 
@@ -35,7 +41,7 @@ class NoriPickPlaceEnv(BaseEnv):
     def _load_scene(self, options: dict):
         self.table_length = 0.8
         self.table_width = 0.6
-        self.table_height = 0.32
+        self.table_height = 0.42
         self.table_top_z = self.floor_z + self.table_height
         half_size = (
             self.table_length / 2,
@@ -72,13 +78,13 @@ class NoriPickPlaceEnv(BaseEnv):
         # on CPU/CUDA depending on self.device, the device the env runs on
         with torch.device(self.device):
             b = len(env_idx)
-            
+            self.agent.reset(torch.as_tensor(self.robot_start_qpos).expand(b, -1))
 
             # here is randomization code that randomizes the x, y position 
             # of the cube we are pushing in the range [-0.1, -0.1] to [0.1, 0.1]
             p = torch.zeros((b, 3))
-            p[..., 0] =  torch.rand((b)) * 0.2 - 0.35
-            p[..., 1] = torch.rand((b)) * 0.2 - 0.2
+            p[..., 0] =  torch.rand((b)) * 0.2 - 0.3
+            p[..., 1] = torch.rand((b)) * 0.2 + .1
             p[..., 2] = self.table_top_z + self.cube_half_size
             q = [1, 0, 0, 0]
             obj_pose = Pose.create_from_pq(p=p, q=q)
@@ -87,8 +93,8 @@ class NoriPickPlaceEnv(BaseEnv):
             goal_p = p.clone()
 
 
-            min_distance = 0.15
-            max_distance = 0.19
+            min_distance = 0.11
+            max_distance = 0.15
             margin = self.goal_radius
 
             low = torch.tensor([
@@ -132,16 +138,17 @@ class NoriPickPlaceEnv(BaseEnv):
         return {}
 
     def evaluate(self):
-        # success is achieved when the cube's xy position on the table is within the
-        # goal region's area (a circle centered at the goal region's xy position)
+        # The cube must be inside the goal in XY and resting at table height.
         is_obj_placed = (
             torch.linalg.norm(
                 self.obj.pose.p[..., :2] - self.goal_region.pose.p[..., :2], axis=1
             )
             < self.goal_radius
         )
+        cube_bottom_z = self.obj.pose.p[..., 2] - self.cube_half_size
+        is_obj_on_table = torch.abs(cube_bottom_z - self.table_top_z) < self.placement_height_tolerance
 
         return {
-            "success": is_obj_placed,
+            "success": is_obj_placed & is_obj_on_table,
         }
 

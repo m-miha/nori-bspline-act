@@ -16,6 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from act.evaluate import evaluate
 from mani_skill.utils import common, gym_utils
 from mani_skill.utils.registration import REGISTERED_ENVS
+import nori.env  # Register Nori in CPU evaluation subprocesses as well.
 
 from collections import defaultdict
 
