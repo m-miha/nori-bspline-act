@@ -31,14 +31,18 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 
 class DETRVAE(nn.Module):
-    """ This is the DETR module that performs object detection """
+    """ACT CVAE with cubic B-spline parameter heads."""
     def __init__(self, backbones, transformer, encoder, state_dim, action_dim, num_queries):
         super().__init__()
         self.num_queries = num_queries
         self.transformer = transformer
         self.encoder = encoder
         hidden_dim = transformer.d_model
-        self.action_head = nn.Linear(hidden_dim, action_dim)
+        self.control_point_head = nn.Linear(hidden_dim, action_dim)
+        self.knot_head = nn.Linear(hidden_dim, num_queries + 4) # knots must be P + 4
+        nn.init.zeros_(self.knot_head.weight)
+        with torch.no_grad():
+            self.knot_head.bias.copy_(torch.arange(num_queries + 4, dtype=self.knot_head.bias.dtype) - 3)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
@@ -52,16 +56,16 @@ class DETRVAE(nn.Module):
         self.latent_dim = 32 # size of latent z
         self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
         self.encoder_state_proj = nn.Linear(state_dim, hidden_dim)  # project state to embedding
-        self.encoder_action_proj = nn.Linear(action_dim, hidden_dim) # project action to embedding
+        self.encoder_action_proj = nn.Linear(action_dim + 1, hidden_dim) # control point and its knot
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var
-        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], state, actions
+        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], state, control points
 
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for state and proprio
 
-    def forward(self, obs, actions=None):
-        is_training = actions is not None
+    def forward(self, obs, spline=None):
+        is_training = spline is not None
         state = obs['state'] if self.backbones is not None else obs
         bs = state.shape[0]
 
@@ -71,7 +75,10 @@ class DETRVAE(nn.Module):
             cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1)  # (bs, 1, hidden_dim)
             state_embed = self.encoder_state_proj(state) # (bs, hidden_dim)
             state_embed = torch.unsqueeze(state_embed, axis=1)  # (bs, 1, hidden_dim)
-            action_embed = self.encoder_action_proj(actions)  # (bs, seq, hidden_dim)
+            encoder_params = torch.cat([
+                spline['control_points'], spline['knots'][:, 3:3+self.num_queries, None]
+            ], dim=-1)
+            action_embed = self.encoder_action_proj(encoder_params)  # (bs, seq, hidden_dim)
             # concat them together to form an input to the CVAE encoder
             encoder_input = torch.cat([cls_embed, state_embed, action_embed], axis=1) # (bs, seq+2, hidden_dim)
             encoder_input = encoder_input.permute(1, 0, 2) # (seq+2, bs, hidden_dim)
@@ -120,8 +127,17 @@ class DETRVAE(nn.Module):
             state = self.input_proj_robot_state(state)
             hs = self.transformer(None, None, self.query_embed.weight, None, latent_input, state, self.additional_pos_embed.weight)[0]
 
-        a_hat = self.action_head(hs)
-        return a_hat, [mu, logvar]
+        control_points = self.control_point_head(hs)
+        # Projection ensures every predicted spline can be evaluated at rollout.
+        raw_knots = self.knot_head(hs.mean(dim=1))
+        knots = torch.sort(raw_knots, dim=-1).values
+        knots = knots + 1e-4 * torch.arange(knots.shape[-1], device=knots.device, dtype=knots.dtype)
+        knots = knots - knots[:, 3:4].clamp_min(0)
+        shortfall = (1 - knots[:, self.num_queries:self.num_queries+1]).clamp_min(0)
+        ramp = ((torch.arange(knots.shape[-1], device=knots.device, dtype=knots.dtype) - 3)
+                / (self.num_queries - 3)).clamp(0, 1)
+        knots = knots + shortfall * ramp
+        return {'control_points': control_points, 'knots': knots}, [mu, logvar]
 
 
 def build_encoder(args):

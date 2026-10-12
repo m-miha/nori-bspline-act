@@ -1,4 +1,4 @@
-"""Collect ACT-ready Nori demonstrations with SAPIEN's click-and-drag gizmo.
+"""Collect absolute-position Nori demonstrations with SAPIEN's click-and-drag gizmo.
 
 Run this script from the ACT baseline directory with a graphical display.
 The viewer's IK moves only the seven controlled joints of Nori's left arm.
@@ -18,8 +18,7 @@ from mani_skill.utils.wrappers import RecordEpisode
 
 
 ENV_ID = "Nori-Pick-Place-v1"
-CONTROL_MODE = "pd_joint_delta_pos"
-ARM_DELTA_LIMIT = 0.1  # nori/agent.py: normalized arm actions map to [-0.1, 0.1] rad.
+CONTROL_MODE = "pd_joint_pos"
 ARM_STEP = 0.05  # Maximum commanded joint change per viewer frame, in radians.
 GRIPPER_RAMP_STEPS = 20  # Close or open over one simulated second.
 GRIPPER_HOLD_STEPS = 8  # Hold the final command for 0.4 simulated seconds.
@@ -77,7 +76,8 @@ def solve_ik_target(env, transform):
 
 
 def execute_gripper(env, gripper_action, steps=8):
-    action = np.r_[np.zeros(len(env.unwrapped.agent.arm_joint_names)), gripper_action].astype(np.float32)
+    arm_target = env.unwrapped.agent.controller.controllers["arm"].get_state()["target_qpos"][0].cpu().numpy()
+    action = np.r_[arm_target, gripper_action].astype(np.float32)
     last_info = None
     done = False
     for _ in range(steps):
@@ -158,7 +158,7 @@ def main():
     observation_dim = env.observation_space.shape[-1]
     action_dim = env.action_space.shape[0]
     if action_dim != len(env.unwrapped.agent.arm_joint_names) + 1:
-        raise ValueError("Nori's action space must be seven arm deltas plus one gripper value")
+        raise ValueError("Nori's action space must be seven arm positions plus one gripper value")
     env = RecordEpisode(
         env,
         output_dir=str(args.output_dir),
@@ -167,7 +167,7 @@ def main():
         save_video=False,
         save_on_reset=False,
         source_type="teleoperation",
-        source_desc="Nori click-and-drag using SAPIEN IK and joint delta control",
+        source_desc="Nori click-and-drag using SAPIEN IK and absolute joint-position control",
     )
 
     seed = args.seed
@@ -282,8 +282,8 @@ def main():
 
             arm_delta = np.zeros(len(env.unwrapped.agent.arm_joint_names))
             tracking = False
+            held_target = arm_controller.get_state()["target_qpos"][0].cpu().numpy()
             if target_arm is not None:
-                held_target = arm_controller.get_state()["target_qpos"][0].cpu().numpy()
                 arm_delta = np.clip(target_arm - held_target, -ARM_STEP, ARM_STEP)
                 tracking = np.max(np.abs(arm_positions(env.unwrapped.agent.robot, env.unwrapped.agent.arm_joint_names) - target_arm)) > 0.01
             moving = np.max(np.abs(arm_delta)) > 1e-4
@@ -293,7 +293,7 @@ def main():
                     gripper_action += (gripper_target - gripper_action) / remaining
                 elif gripper_steps > 0:
                     gripper_action = gripper_target
-                action = np.r_[arm_delta / ARM_DELTA_LIMIT, gripper_action].astype(np.float32)
+                action = np.r_[held_target + arm_delta, gripper_action].astype(np.float32)
                 _, _, terminated, truncated, last_info = env.step(action)
                 check_arm_state(env)
                 if moving:
@@ -309,7 +309,7 @@ def main():
 
     if saved:
         count = validate_dataset(trajectory_path, observation_dim, action_dim)
-        print(f"ACT-ready dataset: {trajectory_path} ({count} successful episodes)")
+        print(f"Absolute-position dataset: {trajectory_path} ({count} successful episodes)")
     else:
         print("No successful episodes saved")
 

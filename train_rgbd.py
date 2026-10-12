@@ -1,4 +1,4 @@
-ALGO_NAME = 'BC_ACT_rgbd'
+ALGO_NAME = 'BC_BSP_rgbd'
 
 import argparse
 import os
@@ -18,6 +18,7 @@ from act.evaluate import evaluate
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils import common, gym_utils
 from mani_skill.utils.registration import REGISTERED_ENVS
+import nori.env  # Register Nori in CPU evaluation subprocesses.
 
 from collections import defaultdict
 
@@ -30,6 +31,7 @@ from diffusers.training_utils import EMAModel
 from act.detr.backbone import build_backbone
 from act.detr.transformer import build_transformer
 from act.detr.detr_vae import build_encoder, DETRVAE
+from act.spline import fit_trajectory, future_segment, spline_training_loss
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 import tyro
@@ -55,7 +57,7 @@ class Args:
 
     env_id: str = "PickCube-v1"
     """the id of the environment"""
-    demo_path: str = 'pickcube.trajectory.rgbd.pd_joint_delta_pos.cpu.h5'
+    demo_path: str = 'pickcube.trajectory.rgbd.pd_joint_pos.cpu.h5'
     """the path of demo dataset (pkl or h5)"""
     num_demos: Optional[int] = None
     """number of trajectories to load from the demo dataset"""
@@ -69,8 +71,8 @@ class Args:
     """the learning rate of the Action Chunking with Transformers"""
     kl_weight: float = 10
     """weight for the kl loss term"""
-    temporal_agg: bool = True
-    """if toggled, temporal ensembling will be performed"""
+    spline_tolerance: float = 0.002
+    spline_speedup: float = 1.0
 
     # Backbone
     position_embedding: str = 'sine'
@@ -87,7 +89,8 @@ class Args:
     hidden_dim: int = 256
     dropout: float = 0.1
     nheads: int = 8
-    num_queries: int = 30
+    num_queries: int = 16
+    action_horizon: int = 30
     pre_norm: bool = False
 
     # Environment/experiment specific arguments
@@ -104,11 +107,11 @@ class Args:
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
-    sim_backend: str = "cpu"
+    sim_backend: str = "physx_cpu"
     """the simulation backend to use for evaluation environments. can be "cpu" or "gpu"""
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
-    control_mode: str = 'pd_joint_delta_pos'
+    control_mode: str = 'pd_joint_pos'
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
@@ -179,7 +182,7 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
 
 
 class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
-    def __init__(self, data_path, num_queries, num_traj, include_depth=True):
+    def __init__(self, data_path, num_queries, action_horizon, tolerance, num_traj, include_depth=True):
         if data_path[-4:] == '.pkl':
             raise NotImplementedError()
         else:
@@ -209,14 +212,6 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
             trajectories['actions'][i] = torch.Tensor(trajectories['actions'][i])
         print('Obs/action pre-processing is done.')
 
-        # When the robot reaches the goal state, its joints and gripper fingers need to remain stationary
-        if 'delta_pos' in args.control_mode or args.control_mode == 'base_pd_joint_vel_arm_pd_joint_vel':
-            self.pad_action_arm = torch.zeros((trajectories['actions'][0].shape[1]-1,))
-            # to make the arm stay still, we pad the action with 0 in 'delta_pos' control mode
-            # gripper action needs to be copied from the last action
-        # else:
-        #     raise NotImplementedError(f'Control Mode {args.control_mode} not supported')
-
         self.slices = []
         self.num_traj = len(trajectories['actions'])
         for traj_idx in range(self.num_traj):
@@ -228,34 +223,24 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         print(f"Length of Dataset: {len(self.slices)}")
 
         self.num_queries = num_queries
+        self.action_horizon = action_horizon
         self.trajectories = trajectories
-        self.delta_control = 'delta' in args.control_mode
-        self.norm_stats = self.get_norm_stats() if not self.delta_control else None
+        self.norm_stats = self.get_norm_stats()
+        self.splines = [fit_trajectory(actions.numpy(), tolerance)
+                        for actions in trajectories['actions']]
 
     def __getitem__(self, index):
         traj_idx, ts = self.slices[index]
 
         # get state at start_ts only
         state = self.trajectories['observations'][traj_idx]['state'][ts]
-        # get num_queries actions
-        act_seq = self.trajectories['actions'][traj_idx][ts:ts+self.num_queries]
-        action_len = act_seq.shape[0]
-
-        # Pad after the trajectory, so all the observations are utilized in training
-        if action_len < self.num_queries:
-            if 'delta_pos' in args.control_mode or args.control_mode == 'base_pd_joint_vel_arm_pd_joint_vel':
-                gripper_action = act_seq[-1, -1]
-                pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
-                act_seq = torch.cat([act_seq, pad_action.repeat(self.num_queries-action_len, 1)], dim=0)
-                # making the robot (arm and gripper) stay still
-            elif not self.delta_control:
-                target = act_seq[-1]
-                act_seq = torch.cat([act_seq, target.repeat(self.num_queries-action_len, 1)], dim=0)
-
-        # normalize state and act_seq
-        if not self.delta_control:
-            state = (state - self.norm_stats["state_mean"][0]) / self.norm_stats["state_std"][0]
-            act_seq = (act_seq - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        act_seq = self.trajectories['actions'][traj_idx][ts:ts+self.action_horizon]
+        if len(act_seq) < self.action_horizon:
+            act_seq = torch.cat([act_seq, act_seq[-1:].repeat(self.action_horizon-len(act_seq), 1)])
+        knots, points = future_segment(*self.splines[traj_idx], ts, self.num_queries)
+        state = (state - self.norm_stats["state_mean"][0]) / self.norm_stats["state_std"][0]
+        act_seq = (act_seq - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        points = (torch.from_numpy(points) - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
         # get rgb or rgbd data at start_ts and combine with state to form obs
         if self.include_depth:
@@ -269,6 +254,8 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         return {
             'observations': obs,
             'actions': act_seq,
+            'spline_control_points': points,
+            'spline_knots': torch.from_numpy(knots),
         }
 
     def __len__(self):
@@ -305,34 +292,22 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         return processed_obs
 
     def get_norm_stats(self):
-        all_state_data = []
-        all_action_data = []
-        for traj_idx, ts in self.slices:
-            state = self.trajectories['observations'][traj_idx]['state'][ts]
-            act_seq = self.trajectories['actions'][traj_idx][ts:ts+self.num_queries]
-            action_len = act_seq.shape[0]
-            if action_len < self.num_queries:
-                target_pos = act_seq[-1]
-                act_seq = torch.cat([act_seq, target_pos.repeat(self.num_queries-action_len, 1)], dim=0)
-            all_state_data.append(state)
-            all_action_data.append(act_seq)
-
-        all_state_data = torch.stack(all_state_data)
-        all_action_data = torch.concatenate(all_action_data)
+        all_state_data = torch.cat([v['state'][:-1] if len(v['state']) == len(self.trajectories['actions'][i]) + 1 else v['state']
+                                    for i, v in enumerate(self.trajectories['observations'])])
+        all_action_data = torch.cat(self.trajectories['actions'])
 
         # normalize obs (state) data
         state_mean = all_state_data.mean(dim=0, keepdim=True)
-        state_std = all_state_data.std(dim=0, keepdim=True)
+        state_std = all_state_data.std(dim=0, keepdim=True, unbiased=False)
         state_std = torch.clip(state_std, 1e-2, np.inf) # clipping
 
         # normalize action data
         action_mean = all_action_data.mean(dim=0, keepdim=True)
-        action_std = all_action_data.std(dim=0, keepdim=True)
+        action_std = all_action_data.std(dim=0, keepdim=True, unbiased=False)
         action_std = torch.clip(action_std, 1e-2, np.inf) # clipping
 
         stats = {"action_mean": action_mean, "action_std": action_std,
-                 "state_mean": state_mean, "state_std": state_std,
-                 "example_state": state}
+                 "state_mean": state_mean, "state_std": state_std}
 
         return stats
 
@@ -372,7 +347,7 @@ class Agent(nn.Module):
             num_queries=args.num_queries,
         )
 
-    def compute_loss(self, obs, action_seq):
+    def compute_loss(self, obs, action_seq, spline):
         # normalize rgb data
         obs['rgb'] = obs['rgb'].float() / 255.0
         obs['rgb'] = self.normalize(obs['rgb'])
@@ -382,18 +357,19 @@ class Agent(nn.Module):
             obs['depth'] = obs['depth'].float()
 
         # forward pass
-        a_hat, (mu, logvar) = self.model(obs, action_seq)
+        prediction, (mu, logvar) = self.model(obs, spline)
 
         # compute l1 loss and kl loss
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
-        all_l1 = F.l1_loss(action_seq, a_hat, reduction='none')
-        l1 = all_l1.mean()
+        regression, points_loss, knots_loss, action_loss = spline_training_loss(prediction, spline, action_seq)
 
         # store all loss
         loss_dict = dict()
-        loss_dict['l1'] = l1
+        loss_dict['control_points'] = points_loss
+        loss_dict['knots'] = knots_loss
+        loss_dict['actions'] = action_loss
         loss_dict['kl'] = total_kld[0]
-        loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
+        loss_dict['loss'] = regression + loss_dict['kl'] * self.kl_weight
         return loss_dict
 
     def get_action(self, obs):
@@ -406,9 +382,9 @@ class Agent(nn.Module):
             obs['depth'] = obs['depth'].float()
 
         # forward pass
-        a_hat, (_, _) = self.model(obs) # no action, sample from prior
+        spline, (_, _) = self.model(obs) # no target, sample from prior
 
-        return a_hat
+        return spline
 
 
 def kl_divergence(mu, logvar):
@@ -431,6 +407,8 @@ def save_ckpt(run_name, tag):
     ema.copy_to(ema_agent.parameters())
     torch.save({
         'norm_stats': dataset.norm_stats,
+        'spline_config': {'degree': 3, 'num_queries': args.num_queries,
+                          'action_horizon': args.action_horizon, 'control_mode': args.control_mode},
         'agent': agent.state_dict(),
         'ema_agent': ema_agent.state_dict(),
     }, f'runs/{run_name}/checkpoints/{tag}.pt')
@@ -474,7 +452,11 @@ if __name__ == "__main__":
     envs = make_eval_envs(args.env_id, args.num_eval_envs, args.sim_backend, env_kwargs, other_kwargs, video_dir=f'runs/{run_name}/videos' if args.capture_video else None, wrappers=wrappers)
 
     # dataloader setup
-    dataset = SmallDemoDataset_ACTPolicy(args.demo_path, args.num_queries, num_traj=args.num_demos, include_depth=args.include_depth)
+    if args.control_mode != 'pd_joint_pos':
+        raise ValueError('B-spline rollout requires pd_joint_pos demonstrations and controller')
+    dataset = SmallDemoDataset_ACTPolicy(args.demo_path, args.num_queries, args.action_horizon,
+                                         args.spline_tolerance, num_traj=args.num_demos,
+                                         include_depth=args.include_depth)
     sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
@@ -500,8 +482,8 @@ if __name__ == "__main__":
             config=config,
             name=run_name,
             save_code=True,
-            group="ACT",
-            tags=["act"]
+            group="BSP",
+            tags=["bspline"]
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -533,14 +515,8 @@ if __name__ == "__main__":
     ema_agent = Agent(envs, args).to(device)
 
     # Evaluation
-    #eval_kwargs = dict(
-    #    stats=dataset.norm_stats, num_queries=args.num_queries, temporal_agg=args.temporal_agg,
-    #    max_timesteps=gym_utils.find_max_episode_steps_value(envs), device=device, sim_backend=args.sim_backend
-    #)
-    eval_kwargs = dict(
-        stats=dataset.norm_stats, num_queries=args.num_queries, temporal_agg=args.temporal_agg,
-        max_timesteps=args.max_episode_steps, device=device, sim_backend=args.sim_backend
-    )
+    eval_kwargs = dict(stats=dataset.norm_stats, device=device,
+                       sim_backend=args.sim_backend, spline_speedup=args.spline_speedup)
 
     # ---------------------------------------------------------------------------- #
     # Training begins.
@@ -554,15 +530,17 @@ if __name__ == "__main__":
         last_tick = time.time()
         # copy data from cpu to gpu
         obs_batch_dict = data_batch['observations']
-        obs_batch_dict = {k: v.cuda(non_blocking=True) for k, v in obs_batch_dict.items()}
-        act_batch = data_batch['actions'].cuda(non_blocking=True)
+        obs_batch_dict = {k: v.to(device, non_blocking=True) for k, v in obs_batch_dict.items()}
+        act_batch = data_batch['actions'].to(device, non_blocking=True)
 
         # forward and compute loss
         loss_dict = agent.compute_loss(
             obs=obs_batch_dict, # obs_batch_dict['state'] is (B, obs_dim)
-            action_seq=act_batch, # (B, num_queries, act_dim)
+            action_seq=act_batch,
+            spline={'control_points': data_batch['spline_control_points'].to(device, non_blocking=True),
+                    'knots': data_batch['spline_knots'].to(device, non_blocking=True)},
         )
-        total_loss = loss_dict['loss']  # total_loss = l1 + kl * self.kl_weight
+        total_loss = loss_dict['loss']
 
         # backward
         optimizer.zero_grad()

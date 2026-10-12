@@ -9,7 +9,8 @@ setup(
         "diffusers",
         "tensorboard",
         "wandb",
-        "mani_skill"
+        "mani_skill",
+        "scipy",
     ],
     description="A minimal setup for ACT for ManiSkill",
     long_description=open("README.md").read(),
