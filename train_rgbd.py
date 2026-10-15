@@ -31,7 +31,7 @@ from diffusers.training_utils import EMAModel
 from act.detr.backbone import build_backbone
 from act.detr.transformer import build_transformer
 from act.detr.detr_vae import build_encoder, DETRVAE
-from act.spline import fit_trajectory, future_segment, spline_training_loss
+from act.spline import fit_trajectory, future_segment, knot_range_scale, spline_training_loss
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 import tyro
@@ -228,6 +228,10 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         self.norm_stats = self.get_norm_stats()
         self.splines = [fit_trajectory(actions.numpy(), tolerance)
                         for actions in trajectories['actions']]
+        self.norm_stats['knot_scale'] = torch.tensor(
+            knot_range_scale(self.splines,
+                             [len(actions) for actions in trajectories['actions']],
+                             self.num_queries))
 
     def __getitem__(self, index):
         traj_idx, ts = self.slices[index]
@@ -302,9 +306,10 @@ class SmallDemoDataset_ACTPolicy(Dataset): # Load everything into memory
         state_std = torch.clip(state_std, 1e-2, np.inf) # clipping
 
         # normalize action data
-        action_mean = all_action_data.mean(dim=0, keepdim=True)
-        action_std = all_action_data.std(dim=0, keepdim=True, unbiased=False)
-        action_std = torch.clip(action_std, 1e-2, np.inf) # clipping
+        action_min = all_action_data.amin(dim=0, keepdim=True)
+        action_max = all_action_data.amax(dim=0, keepdim=True)
+        action_mean = (action_max + action_min) / 2
+        action_std = ((action_max - action_min) / 2).clamp_min(1e-2)
 
         stats = {"action_mean": action_mean, "action_std": action_std,
                  "state_mean": state_mean, "state_std": state_std}
@@ -347,7 +352,7 @@ class Agent(nn.Module):
             num_queries=args.num_queries,
         )
 
-    def compute_loss(self, obs, action_seq, spline):
+    def compute_loss(self, obs, spline, knot_scale):
         # normalize rgb data
         obs['rgb'] = obs['rgb'].float() / 255.0
         obs['rgb'] = self.normalize(obs['rgb'])
@@ -361,13 +366,12 @@ class Agent(nn.Module):
 
         # compute l1 loss and kl loss
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
-        regression, points_loss, knots_loss, action_loss = spline_training_loss(prediction, spline, action_seq)
+        regression, points_loss, knots_loss = spline_training_loss(prediction, spline, knot_scale)
 
         # store all loss
         loss_dict = dict()
         loss_dict['control_points'] = points_loss
         loss_dict['knots'] = knots_loss
-        loss_dict['actions'] = action_loss
         loss_dict['kl'] = total_kld[0]
         loss_dict['loss'] = regression + loss_dict['kl'] * self.kl_weight
         return loss_dict
@@ -531,14 +535,12 @@ if __name__ == "__main__":
         # copy data from cpu to gpu
         obs_batch_dict = data_batch['observations']
         obs_batch_dict = {k: v.to(device, non_blocking=True) for k, v in obs_batch_dict.items()}
-        act_batch = data_batch['actions'].to(device, non_blocking=True)
-
         # forward and compute loss
         loss_dict = agent.compute_loss(
             obs=obs_batch_dict, # obs_batch_dict['state'] is (B, obs_dim)
-            action_seq=act_batch,
             spline={'control_points': data_batch['spline_control_points'].to(device, non_blocking=True),
                     'knots': data_batch['spline_knots'].to(device, non_blocking=True)},
+            knot_scale=dataset.norm_stats['knot_scale'].to(device),
         )
         total_loss = loss_dict['loss']
 

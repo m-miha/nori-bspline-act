@@ -55,6 +55,17 @@ def future_segment(knots, control_points, start_time, num_points):
     return local_knots.astype(np.float32) - start_time, local_points.astype(np.float32)
 
 
+def knot_range_scale(splines, trajectory_lengths, num_points):
+    """Half-range of the relative knot channel used in training targets."""
+    minimum, maximum = np.inf, -np.inf
+    for spline, length in zip(splines, trajectory_lengths):
+        for step in range(length):
+            knots, _ = future_segment(*spline, step, num_points)
+            minimum = min(minimum, float(knots.min()))
+            maximum = max(maximum, float(knots.max()))
+    return max((maximum - minimum) / 2, 1e-2)
+
+
 def sample_spline(knots, control_points, times):
     """Evaluate batched cubic splines in torch; knots may be learned tensors.
 
@@ -79,13 +90,23 @@ def sample_spline(knots, control_points, times):
     return torch.bmm(torch.stack(basis, dim=-1), control_points)
 
 
-def spline_training_loss(prediction, target, actions, reconstruction_weight=1.0):
-    points_loss = torch.nn.functional.l1_loss(prediction["control_points"], target["control_points"])
-    knots_loss = torch.nn.functional.l1_loss(prediction["knots"], target["knots"])
-    times = torch.arange(actions.shape[1], device=actions.device, dtype=actions.dtype)[None].expand(actions.shape[0], -1)
-    reconstructed = sample_spline(prediction["knots"], prediction["control_points"], times)
-    # Local segments have variable duration; do not score later actions against
-    # an extrapolated constant endpoint.
-    valid = (times < target["knots"][:, target["control_points"].shape[1]:target["control_points"].shape[1] + 1]).to(actions.dtype)
-    action_loss = ((reconstructed - actions).abs() * valid[..., None]).sum() / (valid.sum() * actions.shape[-1]).clamp_min(1)
-    return points_loss + knots_loss + reconstruction_weight * action_loss, points_loss, knots_loss, action_loss
+def decode_spline_action(normalized_action, action_mean, action_std, low, high):
+    """Decode absolute arm targets and the final normalized gripper channel.
+
+    Absolute PD arm targets are not clipped by the controller or demonstrations.
+    The gripper controller clips its normalized input to the action bounds.
+    """
+    action = normalized_action * action_std + action_mean
+    return torch.cat([
+        action[..., :-1],
+        action[..., -1:].clamp(low[-1], high[-1]),
+    ], dim=-1)
+
+
+def spline_training_loss(prediction, target, knot_scale):
+    """ACT L1 regression over range-scaled spline parameters."""
+    point_error = (prediction["control_points"] - target["control_points"]).abs()
+    knot_error = (prediction["knots"] - target["knots"]).abs() / knot_scale
+    parameters_per_sample = point_error[0].numel() + knot_error[0].numel()
+    loss = (point_error.sum() + knot_error.sum()) / (point_error.shape[0] * parameters_per_sample)
+    return loss, point_error.mean(), knot_error.mean()

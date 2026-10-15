@@ -33,8 +33,11 @@ def make_eval_envs(env_id, num_envs: int, sim_backend: str, env_kwargs: dict, ot
                 return env
 
             return thunk
-        vector_cls = gym.vector.SyncVectorEnv if num_envs == 1 else lambda x : gym.vector.AsyncVectorEnv(x, context="forkserver")
-        env = vector_cls([cpu_make_env(env_id, seed, video_dir if seed == 0 else None, env_kwargs, other_kwargs) for seed in range(num_envs)])
+        env_fns = [cpu_make_env(env_id, seed, video_dir if seed == 0 else None, env_kwargs, other_kwargs) for seed in range(num_envs)]
+        if num_envs == 1:
+            env = gym.vector.SyncVectorEnv(env_fns, autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
+        else:
+            env = gym.vector.AsyncVectorEnv(env_fns, context="forkserver", autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
     else:
         env = gym.make(env_id, num_envs=num_envs, sim_backend=sim_backend, reconfiguration_freq=1, **env_kwargs)
         max_episode_steps = gym_utils.find_max_episode_steps_value(env)

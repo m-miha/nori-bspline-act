@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 demos/
 ref.txt
+videos/
+act.egg-info/
+d.md
+README.md

@@ -7,7 +7,7 @@ import torch
 
 from mani_skill.utils import common
 
-from act.spline import sample_spline
+from act.spline import decode_spline_action, sample_spline
 
 
 def evaluate(n: int, agent, eval_envs, eval_kwargs):
@@ -45,23 +45,23 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
             if segment is None or torch.any(phase + speedup >= segment['knots'][:, segment['control_points'].shape[1]]):
                 new_segment = agent.get_action(obs)
                 if last_action is not None:
-                    # Match the previous command within the beginning of the new curve.
+                    # Match the previous command within the first half of the new curve.
                     count = new_segment['control_points'].shape[1]
                     start = new_segment['knots'][:, 3].clamp_min(0)
-                    end = torch.minimum(new_segment['knots'][:, count] - 1e-4,
-                                        start + 2 * speedup)
+                    end = start + 0.5 * (new_segment['knots'][:, count] - start)
                     candidates = start[:, None] + (end - start)[:, None] * torch.linspace(
-                        0, 1, 17, device=device)[None]
+                        0, 1, 129, device=device)[None]
                     sampled = sample_spline(new_segment['knots'], new_segment['control_points'], candidates)
-                    error = (((sampled - last_action[:, None]) * action_std) ** 2).mean(dim=-1)
+                    candidate_actions = decode_spline_action(sampled, action_mean, action_std, low, high)
+                    error = ((candidate_actions - last_action[:, None]) ** 2).mean(dim=-1)
                     phase = candidates.gather(1, error.argmin(dim=1, keepdim=True)).squeeze(1)
                 else:
                     phase.zero_()
                 segment = new_segment
 
             normalized_action = sample_spline(segment['knots'], segment['control_points'], phase[:, None])[:, 0]
-            last_action = normalized_action
-            action = (normalized_action * action_std + action_mean).clamp(low, high)
+            action = decode_spline_action(normalized_action, action_mean, action_std, low, high)
+            last_action = action
             if sim_backend == 'physx_cpu':
                 action = action.cpu().numpy()
             obs, rew, terminated, truncated, info = eval_envs.step(action)
@@ -71,11 +71,12 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
                 assert truncated.all() == truncated.any(), 'All episodes must truncate together'
                 if isinstance(info['final_info'], dict):
                     for key, value in info['final_info']['episode'].items():
-                        eval_metrics[key].append(value.float().cpu().numpy())
+                        if not key.startswith('_'):
+                            eval_metrics[key].extend(np.asarray(common.to_numpy(value)).reshape(-1))
                 else:
                     for final_info in info['final_info']:
                         for key, value in final_info['episode'].items():
-                            eval_metrics[key].append(value)
+                            eval_metrics[key].append(np.asarray(common.to_numpy(value)).item())
                 eps_count += num_envs
                 segment = None
                 phase.zero_()
