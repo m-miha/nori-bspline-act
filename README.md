@@ -59,11 +59,8 @@ The default is `0` (disabled). The runner requests a replacement before the old
 segment ends, advances both curves at the selected `--speedup`, and transfers
 arm control with a quintic smoothstep. The gripper follows the replacement
 segment directly. The transition is shortened if either curve lacks sufficient
-remaining support. Duration is rounded to control ticks; at 100 Hz, 0.1 seconds
-is 10 intervals.
+remaining commands. Duration is rounded to control ticks.
 
 The blend lasts a fixed amount of simulated time even when `--speedup` changes.
-Thus each component spline is temporally scaled, but the blended trajectory is
-not an exact time-scaled copy across speed settings.
 
 
