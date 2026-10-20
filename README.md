@@ -14,14 +14,14 @@ pip install -e .
 
 ## Demonstration Collection
 
-Demonstrations were collected in SAPIEN/maniskill using TCP gizmo handling that positioned the end effector, leading to primitive and often overly linear demonstrations. This was done to demonstrate the robustness of this architecture under low quality low sample demonstrations that would potentially reflect home use.
-
+This repository collected demonstrations with the [Nori A3](https://www.norirobotics.com/) as is a realistic choice for home use. Demonstrations were collected in SAPIEN/maniskill using TCP gizmo handling that positioned the end effector, leading to primitive and often overly linear demonstrations. This was done to demonstrate the robustness of this architecture under low quality low sample demonstrations that would potentially reflect home use.
+a
 ```bash
 python collect_nori_demos.py --num-successes 20 --trajectory-name [name]
 ```
 
 Collection happens as follows:
-Drag the **left gripper TCP** gizmo and the end effector follows as you move it.
+Drag the **left gripper** TCP gizmo and the end effector follows as you move it.
 Press `g` to toggle the gripper, `n` to recenter the gizmo, `c` to finish an attempt,
 `r` to discard it and retry the same seed, `b` to discard it and load a new cube/goal
 layout, or `q` to quit. Once you have
