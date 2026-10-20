@@ -1,6 +1,6 @@
 # B-spline ACT for ManiSkill with Blending
 
-This project adapts ACT to predict cubic B-spline control points (based off of [this paper](https://arxiv.org/abs/2607.09648)) and adds a novel blending technique for smooth handoffs during spline alignment.
+This project adapts ACT to predict cubic B-spline control points (working off of [this paper](https://arxiv.org/abs/2607.09648)) and adds a novel blending technique for smooth handoffs during spline alignment.
 
 ## Installation
 
@@ -52,7 +52,7 @@ python run.py [checkpoint] --speedup 2
 `2` for twice the curve speed, `0.5` for half speed, etc.
 
 
-### Running a checkpoint with novel blending for handoffs
+## Running a checkpoint with novel blending for handoffs
 
 Add `--blend-seconds 0.1` for a 100 ms transition between sampled arm commands.
 The default is `0` (disabled). The runner requests a replacement before the old
