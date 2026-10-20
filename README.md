@@ -1,6 +1,6 @@
 # B-spline ACT for ManiSkill with Blending
 
-This project adapts ACT to predict cubic B-spline control points and knots and adds a novel blending technique for smooth handoffs during spline alignment.
+This project adapts ACT to predict cubic B-spline control points (based off of [this paper](https://arxiv.org/abs/2607.09648)) and adds a novel blending technique for smooth handoffs during spline alignment.
 
 ## Installation
 
