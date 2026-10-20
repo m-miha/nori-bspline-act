@@ -8,3 +8,5 @@ ref.txt
 videos/
 act.egg-info/
 d.md
+nori_description/
+*.urdf
